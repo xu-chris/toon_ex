@@ -171,8 +171,8 @@ defmodule Toon.Encode do
 
         ["[", length_marker, delimiter_marker, "]: ", values]
 
-      # Tabular array (all maps with same keys)
-      Utils.all_maps?(data) and Utils.same_keys?(data) ->
+      # Tabular array (all maps with same keys and primitive values only)
+      Utils.all_maps?(data) and Utils.same_keys?(data) and Utils.all_primitive_values?(data) ->
         encode_root_tabular_array(data, length_marker, delimiter_marker, opts)
 
       # List format (mixed or non-uniform)

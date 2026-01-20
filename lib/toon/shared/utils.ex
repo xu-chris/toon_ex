@@ -141,6 +141,37 @@ defmodule Toon.Utils do
   def same_keys?(_), do: false
 
   @doc """
+  Checks if all values in all maps of a list are primitives (for tabular format).
+
+  ## Examples
+
+      iex> Toon.Utils.all_primitive_values?([%{"a" => 1}, %{"a" => 2}])
+      true
+
+      iex> Toon.Utils.all_primitive_values?([%{"a" => 1, "b" => "x"}, %{"a" => 2, "b" => "y"}])
+      true
+
+      iex> Toon.Utils.all_primitive_values?([%{"a" => %{"nested" => 1}}])
+      false
+
+      iex> Toon.Utils.all_primitive_values?([%{"a" => [1, 2]}])
+      false
+
+      iex> Toon.Utils.all_primitive_values?([])
+      true
+  """
+  @spec all_primitive_values?(list()) :: boolean()
+  def all_primitive_values?([]), do: true
+
+  def all_primitive_values?(list) when is_list(list) do
+    Enum.all?(list, fn map ->
+      is_map(map) and Enum.all?(Map.values(map), &primitive?/1)
+    end)
+  end
+
+  def all_primitive_values?(_), do: false
+
+  @doc """
   Repeats a string n times.
 
   ## Examples
@@ -179,6 +210,7 @@ defmodule Toon.Utils do
   def normalize(nil), do: nil
   def normalize(value) when is_boolean(value), do: value
   def normalize(value) when is_binary(value), do: value
+  def normalize(value) when is_atom(value), do: Atom.to_string(value)
 
   def normalize(value) when is_number(value) do
     cond do
@@ -199,10 +231,10 @@ defmodule Toon.Utils do
     result = Toon.Encoder.encode(struct, [])
 
     # If encoder returns iodata (string), convert it to binary
-    # If encoder returns a map (from @derive), use it directly
+    # If encoder returns a map (from @derive), normalize it recursively
     case result do
       binary when is_binary(binary) -> binary
-      map when is_map(map) -> map
+      map when is_map(map) -> normalize(map)
       iodata -> IO.iodata_to_binary(iodata)
     end
   end
