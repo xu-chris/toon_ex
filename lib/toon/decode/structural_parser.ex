@@ -582,8 +582,9 @@ defmodule Toon.Decode.StructuralParser do
           parse_list_items(rest, expected_indent, opts, acc)
         end
 
-      # Inline array item (check before general list marker)
-      String.match?(line.content, ~r/^\s*- \[.*\]:/) ->
+      # Inline array item with values on same line: - [N]: val1,val2
+      # (must have content after ": ", otherwise it's a list-format array header)
+      String.match?(line.content, ~r/^\s*- \[.*\]: .+/) ->
         {item, remaining} = parse_inline_array_item(line, rest, expected_indent, opts)
         parse_list_items(remaining, expected_indent, opts, [item | acc])
 
@@ -614,9 +615,13 @@ defmodule Toon.Decode.StructuralParser do
       trimmed == "" or String.trim(trimmed) == "" ->
         {%{}, rest}
 
-      String.match?(trimmed, ~r/^\[.*?\]:/) ->
-        # This is an inline array within a list item
+      # Inline array with values on same line: [N]: val1,val2 (has content after ": ")
+      String.match?(trimmed, ~r/^\[.*?\]: .+/) ->
         parse_inline_array_from_line(trimmed, rest)
+
+      # List-format array header only: [N]: (no content after colon, nested items below)
+      String.match?(trimmed, ~r/^\[#?\d+[^\]]*\]:$/) ->
+        parse_nested_list_array(trimmed, rest, line, expected_indent, opts)
 
       # Tabular array as first field: key[N]{fields}: (with optional quoted key)
       String.match?(trimmed, ~r/^(?:"[^"]*"|\w+)\[#?\d+.*\]\{[^}]+\}:$/) ->
@@ -959,6 +964,21 @@ defmodule Toon.Decode.StructuralParser do
       nil ->
         # Malformed, return as string
         {trimmed, rest}
+    end
+  end
+
+  # Parse nested list-format array within a list item (e.g., "- [1]:" with nested items)
+  defp parse_nested_list_array(_trimmed, rest, _line, expected_indent, opts) do
+    array_lines = take_nested_lines(rest, expected_indent)
+
+    if Enum.empty?(array_lines) do
+      {[], rest}
+    else
+      nested_indent = get_first_content_indent(array_lines)
+      array_items = parse_list_items(array_lines, nested_indent, opts, [])
+      {rest_after_array, _} = skip_nested_lines(rest, expected_indent)
+
+      {array_items, rest_after_array}
     end
   end
 
