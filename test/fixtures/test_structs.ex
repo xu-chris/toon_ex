@@ -26,14 +26,3 @@ defmodule Toon.Fixtures.Company do
   @derive Toon.Encoder
   defstruct [:name, :ceo]
 end
-
-defmodule Toon.Fixtures.UserWithOnly do
-  @moduledoc false
-  @derive {Toon.Encoder, only: [:name]}
-  defstruct [:name, :email, :password]
-end
-
-defmodule Toon.Fixtures.StructWithoutEncoder do
-  @moduledoc "Test struct without Toon.Encoder implementation"
-  defstruct [:id, :value]
-end
