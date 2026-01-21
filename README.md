@@ -3,6 +3,8 @@
 [![Hex.pm](https://img.shields.io/hexpm/v/toon.svg)](https://hex.pm/packages/toon)
 [![Documentation](https://img.shields.io/badge/docs-hexdocs-blue.svg)](https://hexdocs.pm/toon)
 [![Coverage Status](https://coveralls.io/repos/github/xu-chris/toon_ex/badge.svg?branch=main)](https://coveralls.io/github/xu-chris/toon_ex?branch=main)
+[![SPEC v3.0](https://img.shields.io/badge/spec-v3.0-fef3c0?labelColor=1b1b1f)](https://github.com/toon-format/spec)
+[![License: MIT](https://img.shields.io/badge/license-MIT-fef3c0?labelColor=1b1b1f)](./LICENSE.md)
 
 **TOON (Token-Oriented Object Notation)** encoder and decoder for Elixir.
 
@@ -10,14 +12,9 @@ TOON is a compact data format optimized for LLM token efficiency, achieving **30
 
 ## 🎯 Specification Compliance
 
-This implementation is tested against the [official TOON specification v1.3.3](https://github.com/toon-format/spec) (2025-10-31) using the official test fixtures.
+This implementation is tested against the [official TOON specification v3.0.1](https://github.com/toon-format/spec) (2025-12-05) using the official test fixtures.
 
-**Test Fixtures:** [toon-format/spec@b9c71f7](https://github.com/toon-format/spec/tree/b9c71f72f1d243b17a5c21a56273d556a7a08007)
-
-**Compliance Status:**
-- ✅ **100% (306/306 tests passing)**
-- ✅ **Decoder: 100% (160/160 tests)**
-- ✅ **Encoder: 100% (146/146 tests)**
+**Test Fixtures:** [toon-format/spec@f9af6fa](https://github.com/toon-format/spec/tree/v3.0.1)
 
 Tests validate semantic equivalence (both outputs decode to the same data structure), ensuring correctness independent of Elixir 1.19's automatic key sorting.
 

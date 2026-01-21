@@ -154,7 +154,7 @@ defmodule Toon.Encode do
   # Encode root-level array per TOON spec Section 5
   defp encode_root_array(data, depth, opts) do
     length_marker = format_length_marker(length(data), opts.length_marker)
-    delimiter_marker = if opts.delimiter != ",", do: opts.delimiter, else: ""
+    delimiter_marker = format_delimiter_marker(opts.delimiter)
 
     cond do
       # Empty array
@@ -277,7 +277,7 @@ defmodule Toon.Encode do
 
       Utils.all_primitives?(item) ->
         length_marker = format_length_marker(length(item), opts.length_marker)
-        delimiter_marker = if opts.delimiter != ",", do: opts.delimiter, else: ""
+        delimiter_marker = format_delimiter_marker(opts.delimiter)
 
         values =
           item
@@ -301,7 +301,7 @@ defmodule Toon.Encode do
       true ->
         # Complex nested array
         length_marker = format_length_marker(length(item), opts.length_marker)
-        delimiter_marker = if opts.delimiter != ",", do: opts.delimiter, else: ""
+        delimiter_marker = format_delimiter_marker(opts.delimiter)
 
         header = [
           Constants.list_item_marker(),
@@ -359,4 +359,8 @@ defmodule Toon.Encode do
   # Format length marker
   defp format_length_marker(length, nil), do: Integer.to_string(length)
   defp format_length_marker(length, marker), do: marker <> Integer.to_string(length)
+
+  @compile {:inline, format_delimiter_marker: 1}
+  defp format_delimiter_marker(","), do: ""
+  defp format_delimiter_marker(delimiter), do: delimiter
 end
