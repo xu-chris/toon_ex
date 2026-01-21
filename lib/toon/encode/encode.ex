@@ -32,7 +32,7 @@ defmodule Toon.Encode do
       iex> Toon.Encode.encode(%{"name" => "Alice"}, indent: 4)
       {:ok, "name: Alice"}
   """
-  @spec encode(Toon.Types.encodable(), keyword()) ::
+  @spec encode(Toon.Types.input(), keyword()) ::
           {:ok, String.t()} | {:error, EncodeError.t()}
   def encode(data, opts \\ []) do
     start_time = System.monotonic_time()
@@ -99,7 +99,7 @@ defmodule Toon.Encode do
       iex> Toon.Encode.encode!(%{"tags" => ["a", "b"]})
       "tags[2]: a,b"
   """
-  @spec encode!(Toon.Types.encodable(), keyword()) :: String.t()
+  @spec encode!(Toon.Types.input(), keyword()) :: String.t()
   def encode!(data, opts \\ []) do
     case encode(data, opts) do
       {:ok, result} -> result

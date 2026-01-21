@@ -161,4 +161,40 @@ defmodule Toon.EncoderTest do
       assert Toon.Utils.normalize(user) == %{"name" => "Bob", "email" => "bob@test.com"}
     end
   end
+
+  # These tests verify the public API accepts structs and atom-keyed maps.
+  # The Encoder protocol handles normalization, so the type specs must accept term().
+  describe "Toon.encode!/1 accepts structs (Dialyzer compatibility)" do
+    test "encodes struct with @derive Toon.Encoder" do
+      person = %Person{name: "Alice", age: 30}
+      result = Toon.encode!(person)
+
+      assert result =~ "name: Alice"
+      assert result =~ "age: 30"
+    end
+
+    test "encodes struct with explicit Encoder implementation" do
+      date = %CustomDate{year: 2024, month: 6, day: 15}
+      result = Toon.encode!(date)
+
+      assert result == "2024-06-15"
+    end
+  end
+
+  describe "Toon.encode!/1 accepts maps with atom keys (Dialyzer compatibility)" do
+    test "encodes map with atom keys" do
+      data = %{name: "Bob", active: true}
+      result = Toon.encode!(data)
+
+      assert result =~ "name: Bob"
+      assert result =~ "active: true"
+    end
+
+    test "encodes nested map with atom keys" do
+      data = %{user: %{name: "Charlie", age: 25}}
+      result = Toon.encode!(data)
+
+      assert result =~ "name: Charlie"
+    end
+  end
 end
