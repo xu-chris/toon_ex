@@ -78,7 +78,7 @@ defmodule Toon do
       iex> Toon.encode(%{"data" => [1, 2, 3]}, delimiter: "\\t")
       {:ok, "data[3\\t]: 1\\t2\\t3"}
   """
-  @spec encode(Toon.Types.encodable(), keyword()) ::
+  @spec encode(Toon.Types.input(), keyword()) ::
           {:ok, String.t()} | {:error, EncodeError.t()}
   defdelegate encode(data, opts \\ []), to: Encode
 
@@ -96,7 +96,7 @@ defmodule Toon do
       iex> Toon.encode!(%{"count" => 42, "active" => true})
       "active: true\\ncount: 42"
   """
-  @spec encode!(Toon.Types.encodable(), keyword()) :: String.t()
+  @spec encode!(Toon.Types.input(), keyword()) :: String.t()
   defdelegate encode!(data, opts \\ []), to: Encode
 
   @doc """

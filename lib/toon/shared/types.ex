@@ -12,11 +12,23 @@ defmodule Toon.Types do
   @type primitive :: nil | boolean() | number() | String.t()
 
   @typedoc """
-  A JSON-compatible value that can be encoded to TOON format.
+  Any value that can be passed to the encoder.
 
-  This is a recursive type that includes:
+  The `Toon.Encoder` protocol normalizes input before encoding:
+  - Structs via `@derive Toon.Encoder` or explicit implementations
+  - Maps with atom keys are converted to string keys
+  - Custom types implement the protocol to define their encoding
+
+  This is `term()` because any type with an Encoder implementation is valid.
+  """
+  @type input :: term()
+
+  @typedoc """
+  A normalized JSON-compatible value (output of encoding).
+
+  After the Encoder protocol processes input, the result is:
   - Primitives: `nil`, `boolean()`, `number()`, `String.t()`
-  - Maps: `%{optional(String.t()) => encodable()}`
+  - Maps with string keys: `%{optional(String.t()) => encodable()}`
   - Lists: `[encodable()]`
   """
   @type encodable ::
