@@ -102,5 +102,27 @@ defmodule Toon.Encode.ObjectsTest do
 
       assert result == "age: 30\nname: Alice"
     end
+
+    test "uses nested path key_order for nested objects" do
+      opts = %{
+        delimiter: ",",
+        length_marker: nil,
+        indent: 2,
+        indent_string: "  ",
+        key_order: %{["user"] => ["first", "last"]},
+        key_folding: "off"
+      }
+
+      data = %{"user" => %{"last" => "Smith", "first" => "John"}}
+      result = Objects.encode(data, 0, opts) |> IO.iodata_to_binary()
+
+      # Nested "user" object should use specified order: first, last
+      assert result =~ "first: John"
+      assert result =~ "last: Smith"
+      # Verify "first" appears before "last" in the output
+      first_pos = :binary.match(result, "first")
+      last_pos = :binary.match(result, "last")
+      assert elem(first_pos, 0) < elem(last_pos, 0)
+    end
   end
 end
