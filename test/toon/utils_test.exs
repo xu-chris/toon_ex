@@ -44,8 +44,14 @@ defmodule Toon.UtilsTest do
       assert Utils.same_keys?(42) == false
     end
 
-    test "returns false for list containing non-maps" do
+    test "returns false for list starting with non-map" do
+      # Exercises the fallback clause: def same_keys?(_), do: false
       assert Utils.same_keys?([1, 2, 3]) == false
+    end
+
+    test "returns false for list with map followed by non-maps" do
+      # Exercises the Enum.all? logic with is_map check inside
+      assert Utils.same_keys?([%{"a" => 1}, 2, 3]) == false
     end
   end
 
