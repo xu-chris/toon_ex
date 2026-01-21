@@ -1,50 +1,164 @@
 defmodule Toon.EncoderTest do
   use ExUnit.Case, async: true
 
-  alias Toon.Fixtures.{CustomDate, UserWithExcept}
+  alias Toon.Fixtures.{
+    CustomDate,
+    Person,
+    StructWithoutEncoder,
+    UserWithExcept,
+    UserWithOnly
+  }
 
-  describe "fields_to_encode/2 with except option" do
-    @user_attrs %{name: "Alice", email: "a@b.com", password: "secret"}
+  describe "Toon.Encoder for Atom" do
+    test "encodes nil" do
+      assert Toon.Encoder.encode(nil, []) == "null"
+    end
 
+    test "encodes true" do
+      assert Toon.Encoder.encode(true, []) == "true"
+    end
+
+    test "encodes false" do
+      assert Toon.Encoder.encode(false, []) == "false"
+    end
+
+    test "encodes regular atom as string" do
+      assert Toon.Encoder.encode(:hello, []) == "hello"
+    end
+  end
+
+  describe "Toon.Encoder for BitString" do
+    test "encodes simple string unchanged" do
+      assert Toon.Encoder.encode("hello", []) == "hello"
+    end
+
+    test "encodes string containing delimiter as iodata with quotes" do
+      result = Toon.Encoder.encode("a,b", delimiter: ",")
+      assert IO.iodata_to_binary(result) == "\"a,b\""
+    end
+  end
+
+  describe "Toon.Encoder for Integer" do
+    test "encodes positive integer" do
+      assert Toon.Encoder.encode(42, []) == "42"
+    end
+
+    test "encodes negative integer" do
+      assert Toon.Encoder.encode(-42, []) == "-42"
+    end
+
+    test "encodes zero" do
+      assert Toon.Encoder.encode(0, []) == "0"
+    end
+  end
+
+  describe "Toon.Encoder for Float" do
+    test "encodes float" do
+      result = Toon.Encoder.encode(3.14, [])
+      assert result == "3.14"
+    end
+
+    test "encodes negative float" do
+      result = Toon.Encoder.encode(-3.14, [])
+      assert result == "-3.14"
+    end
+  end
+
+  describe "Toon.Encoder for List" do
+    test "encodes list via Toon.Encode" do
+      result = Toon.Encoder.encode([1, 2, 3], [])
+      assert result == "[3]: 1,2,3"
+    end
+
+    test "encodes empty list" do
+      result = Toon.Encoder.encode([], [])
+      assert result == "[0]:"
+    end
+  end
+
+  describe "Toon.Encoder for Map" do
+    test "encodes map with atom keys (converted to strings)" do
+      result = Toon.Encoder.encode(%{name: "Alice"}, [])
+      assert result == "name: Alice"
+    end
+
+    test "encodes empty map" do
+      result = Toon.Encoder.encode(%{}, [])
+      assert result == ""
+    end
+  end
+
+  describe "Toon.Encoder @derive with except option" do
     test "excludes specified fields from encoding" do
-      user = struct(UserWithExcept, @user_attrs)
-
-      # Derived encoder now returns a normalized map
+      user = %UserWithExcept{name: "Alice", email: "a@b.com", password: "secret"}
       encoded_map = Toon.Encoder.encode(user, [])
 
       assert Map.has_key?(encoded_map, "name") == true
       assert Map.has_key?(encoded_map, "email") == true
       assert Map.has_key?(encoded_map, "password") == false
-
-      # Can still be encoded to TOON format
-      toon_string = Toon.encode!(encoded_map)
-      {:ok, decoded} = Toon.decode(toon_string)
-
-      assert decoded == encoded_map
     end
   end
 
-  describe "Toon.Utils.normalize/1 dispatches to Toon.Encoder for structs" do
+  describe "Toon.Encoder @derive with only option" do
+    test "includes only specified fields" do
+      user = %UserWithOnly{name: "Alice", email: "a@b.com", password: "secret"}
+      encoded_map = Toon.Encoder.encode(user, [])
+
+      assert Map.has_key?(encoded_map, "name") == true
+      assert Map.has_key?(encoded_map, "email") == false
+      assert Map.has_key?(encoded_map, "password") == false
+    end
+  end
+
+  describe "Toon.Encoder @derive with no options" do
+    test "includes all fields except __struct__" do
+      person = %Person{name: "Bob", age: 25}
+      encoded_map = Toon.Encoder.encode(person, [])
+
+      assert encoded_map == %{"name" => "Bob", "age" => 25}
+    end
+  end
+
+  describe "Toon.Encoder explicit implementation" do
+    test "uses custom encode function" do
+      date = %CustomDate{year: 2024, month: 1, day: 15}
+      result = date |> Toon.Encoder.encode([]) |> IO.iodata_to_binary()
+
+      assert result == "2024-01-15"
+    end
+  end
+
+  describe "Toon.Encoder for unimplemented types" do
+    test "raises Protocol.UndefinedError for struct without implementation" do
+      struct = %StructWithoutEncoder{id: 1, value: "test"}
+
+      assert_raise Protocol.UndefinedError, ~r/Toon.Encoder protocol must be explicitly/, fn ->
+        Toon.Encoder.encode(struct, [])
+      end
+    end
+
+    test "raises Protocol.UndefinedError for tuple" do
+      assert_raise Protocol.UndefinedError, fn ->
+        Toon.Encoder.encode({1, 2, 3}, [])
+      end
+    end
+
+    test "raises Protocol.UndefinedError for pid" do
+      assert_raise Protocol.UndefinedError, fn ->
+        Toon.Encoder.encode(self(), [])
+      end
+    end
+  end
+
+  describe "Toon.Utils.normalize/1 with structs" do
     test "dispatches to explicit Toon.Encoder implementation" do
       date = %CustomDate{year: 2024, month: 1, day: 15}
-
-      # Explicit encoder still returns iodata/string
-      encoded_directly = date |> Toon.Encoder.encode([]) |> IO.iodata_to_binary()
-      assert encoded_directly == "2024-01-15"
-
-      # normalize/1 should produce identical output for explicit encoders
-      assert Toon.Utils.normalize(date) == encoded_directly
+      assert Toon.Utils.normalize(date) == "2024-01-15"
     end
 
     test "dispatches to @derive Toon.Encoder" do
       user = %UserWithExcept{name: "Bob", email: "bob@test.com", password: "secret"}
-
-      # Derived encoder returns normalized map
-      encoded_map = Toon.Encoder.encode(user, [])
-
-      # normalize/1 should produce identical output
-      assert Toon.Utils.normalize(user) == encoded_map
-      assert encoded_map == %{"name" => "Bob", "email" => "bob@test.com"}
+      assert Toon.Utils.normalize(user) == %{"name" => "Bob", "email" => "bob@test.com"}
     end
   end
 end

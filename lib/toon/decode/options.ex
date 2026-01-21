@@ -18,6 +18,11 @@ defmodule Toon.Decode.Options do
       type: :pos_integer,
       default: 2,
       doc: "Expected indentation size in spaces (for strict mode validation)"
+    ],
+    expand_paths: [
+      type: {:in, ["off", "safe"]},
+      default: "off",
+      doc: "Path expansion: 'off' | 'safe' (expand unquoted dotted keys)"
     ]
   ]
 

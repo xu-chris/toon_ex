@@ -9,6 +9,17 @@ defmodule Toon.Decode.StructuralParser do
   alias Toon.Decode.Parser
   alias Toon.DecodeError
 
+  @invalid_escape_pattern ~r/\\/
+
+  # Module-level regex patterns for structural matching
+  @tabular_header_pattern ~r/^(?:"[^"]*"|[\w.]+)\[\d+.*\]\{[^}]+\}:$/
+  @list_header_pattern ~r/^(?:"[^"]*"|[\w.]+)\[\d+.*\]:$/
+  @inline_array_pattern ~r/^\[.*?\]: .+/
+  @list_array_header_pattern ~r/^\[\d+[^\]]*\]:$/
+  @field_pattern ~r/^[\w"]+\s*:/
+  @tabular_header_regex ~r/^((?:"[^"]*"|[\w.]+))(\[\d+.*\])\{([^}]+)\}:$/
+  @list_array_regex ~r/^((?:"[^"]*"|[\w.]+))\[(\d+).*\]:$/
+
   @type line_info :: %{
           content: String.t(),
           indent: non_neg_integer(),
@@ -16,12 +27,17 @@ defmodule Toon.Decode.StructuralParser do
           original: String.t()
         }
 
+  @type parse_metadata :: %{
+          quoted_keys: MapSet.t(String.t()),
+          key_order: list(String.t())
+        }
+
   @doc """
   Parses TOON input string into a structured format.
 
-  Returns the decoded value which can be a map, list, or primitive.
+  Returns a tuple of {result, metadata} where metadata contains quoted_keys and key_order.
   """
-  @spec parse(String.t(), map()) :: {:ok, term()} | {:error, DecodeError.t()}
+  @spec parse(String.t(), map()) :: {:ok, {term(), parse_metadata()}} | {:error, DecodeError.t()}
   def parse(input, opts) when is_binary(input) do
     lines = preprocess_lines(input)
 
@@ -30,14 +46,22 @@ defmodule Toon.Decode.StructuralParser do
       validate_indentation(lines, opts)
     end
 
-    case lines do
-      [] ->
-        {:ok, %{}}
+    # Initialize metadata accumulator
+    initial_metadata = %{
+      quoted_keys: MapSet.new(),
+      key_order: []
+    }
 
-      _ ->
-        result = parse_structure(lines, 0, opts)
-        {:ok, result}
-    end
+    {result, metadata} =
+      case lines do
+        [] ->
+          {%{}, initial_metadata}
+
+        _ ->
+          parse_structure(lines, 0, opts, initial_metadata)
+      end
+
+    {:ok, {result, metadata}}
   rescue
     e in DecodeError ->
       {:error, e}
@@ -109,18 +133,18 @@ defmodule Toon.Decode.StructuralParser do
   end
 
   # Parse a structure starting from given lines at a specific indent level
-  defp parse_structure(lines, base_indent, opts) do
+  defp parse_structure(lines, base_indent, opts, metadata) do
     {root_type, _} = detect_root_type(lines)
 
     case root_type do
       :root_array ->
-        parse_root_array(lines, opts)
+        parse_root_array(lines, opts, metadata)
 
       :root_primitive ->
-        parse_root_primitive(lines, opts)
+        parse_root_primitive(lines, opts, metadata)
 
       :object ->
-        parse_object_lines(lines, base_indent, opts)
+        parse_object_lines(lines, base_indent, opts, metadata)
     end
   end
 
@@ -158,20 +182,23 @@ defmodule Toon.Decode.StructuralParser do
   end
 
   # Parse root primitive value (single value without key)
-  defp parse_root_primitive([%{content: content}], _opts) do
+  defp parse_root_primitive([%{content: content}], _opts, metadata) do
     # For root primitives, we parse directly without parser combinator
     # This handles quoted strings with escapes correctly
-    parse_value(content)
+    {parse_value(content), metadata}
   end
 
   # Parse root-level array
-  defp parse_root_array([%{content: header_line} = line_info | rest], opts) do
+  defp parse_root_array([%{content: header_line} = line_info | rest], opts, metadata) do
     case Parser.parse_line(header_line) do
       {:ok, [result], "", _, _, _} ->
         # Handle inline array
         case result do
-          {_key, value} when is_list(value) ->
-            value
+          {key, value} when is_list(value) ->
+            # Track metadata from parsed key-value
+            was_quoted = key_was_quoted?(header_line)
+            updated_metadata = add_key_to_metadata(key, was_quoted, metadata)
+            {value, updated_metadata}
 
           _ ->
             raise DecodeError, message: "Invalid root array format", input: header_line
@@ -179,23 +206,23 @@ defmodule Toon.Decode.StructuralParser do
 
       {:error, _reason, _, _, _, _} ->
         # Try parsing as tabular or list format
-        parse_complex_root_array(line_info, rest, opts)
+        parse_complex_root_array(line_info, rest, opts, metadata)
     end
   end
 
-  defp parse_complex_root_array(%{content: header}, rest, opts) do
+  defp parse_complex_root_array(%{content: header}, rest, opts, metadata) do
     cond do
       # Inline array with delimiter marker: [3\t]: ... or [3|]: ... or [3]: ...
       String.match?(header, ~r/^\[\d+[^\]]*\]: /) ->
-        parse_root_inline_array(header, opts)
+        {parse_root_inline_array(header, opts), metadata}
 
       # Tabular array: [N]{fields}:
       String.match?(header, ~r/^\[\d+[^\]]*\]\{[^}]+\}:$/) ->
-        parse_tabular_array_data(header, rest, 0, opts)
+        {parse_tabular_array_data(header, rest, 0, opts), metadata}
 
       # List array: [N]:
       String.match?(header, ~r/^\[\d+[^\]]*\]:$/) ->
-        parse_list_array_items(rest, 0, opts)
+        {parse_list_array_items(rest, 0, opts), metadata}
 
       true ->
         raise DecodeError, message: "Invalid root array header", input: header
@@ -207,9 +234,9 @@ defmodule Toon.Decode.StructuralParser do
     # Extract everything after ": "
     case String.split(header, ": ", parts: 2) do
       [array_marker, values_str] ->
-        # Extract declared length from [N] or [#N]
+        # Extract declared length from [N]
         declared_length =
-          case Regex.run(~r/\[#?(\d+)/, array_marker) do
+          case Regex.run(~r/\[(\d+)/, array_marker) do
             [_, length_str] -> String.to_integer(length_str)
             _ -> nil
           end
@@ -231,69 +258,84 @@ defmodule Toon.Decode.StructuralParser do
     end
   end
 
-  # Parse object from lines
-  defp parse_object_lines(lines, base_indent, opts) do
-    {entries, _remaining} = parse_entries(lines, base_indent, opts)
-
-    # Convert to map with appropriate key type
+  # Helper function to build map with appropriate key type
+  defp build_map_with_keys(entries, opts) do
     case opts.keys do
-      :strings ->
-        Map.new(entries)
-
-      :atoms ->
-        Map.new(entries, fn {k, v} -> {String.to_atom(k), v} end)
-
-      :atoms! ->
-        Map.new(entries, fn {k, v} -> {String.to_existing_atom(k), v} end)
+      :strings -> Map.new(entries)
+      :atoms -> Map.new(entries, fn {k, v} -> {String.to_atom(k), v} end)
+      :atoms! -> Map.new(entries, fn {k, v} -> {String.to_existing_atom(k), v} end)
     end
   end
 
-  # Parse entries at a specific indentation level
-  defp parse_entries([], _base_indent, _opts), do: {[], []}
+  defp put_key(map, key, value, opts) do
+    case opts.keys do
+      :strings -> Map.put(map, key, value)
+      :atoms -> Map.put(map, String.to_atom(key), value)
+      :atoms! -> Map.put(map, String.to_existing_atom(key), value)
+    end
+  end
 
-  defp parse_entries([line | rest] = lines, base_indent, opts) do
+  defp empty_map(_opts), do: %{}
+
+  # Parse object from lines
+  defp parse_object_lines(lines, base_indent, opts, metadata) do
+    {entries, _remaining, updated_metadata} = parse_entries(lines, base_indent, opts, metadata)
+    {build_map_with_keys(entries, opts), updated_metadata}
+  end
+
+  # Parse entries at a specific indentation level
+  defp parse_entries([], _base_indent, _opts, metadata), do: {[], [], metadata}
+
+  defp parse_entries([line | rest] = lines, base_indent, opts, metadata) do
     cond do
       # Skip blank lines (only at root level or when not strict)
       line.is_blank ->
         # When strict, blank lines in nested content should be rejected by take_nested_lines
-        parse_entries(rest, base_indent, opts)
+        parse_entries(rest, base_indent, opts, metadata)
 
       # Skip lines that are less indented (parent level)
       line.indent < base_indent ->
-        {[], lines}
+        {[], lines, metadata}
 
       # Skip lines that are more indented (will be handled by parent)
       line.indent > base_indent ->
-        {[], lines}
+        {[], lines, metadata}
 
       # Process line at current level
       true ->
-        case parse_entry_line(line, rest, base_indent, opts) do
-          {:entry, key, value, remaining} ->
-            {entries, final_remaining} = parse_entries(remaining, base_indent, opts)
-            {[{key, value} | entries], final_remaining}
+        case parse_entry_line(line, rest, base_indent, opts, metadata) do
+          {:entry, key, value, remaining, updated_metadata} ->
+            {entries, final_remaining, final_metadata} =
+              parse_entries(remaining, base_indent, opts, updated_metadata)
 
-          {:skip, remaining} ->
-            parse_entries(remaining, base_indent, opts)
+            {[{key, value} | entries], final_remaining, final_metadata}
+
+          {:skip, remaining, updated_metadata} ->
+            parse_entries(remaining, base_indent, opts, updated_metadata)
         end
     end
   end
 
   # Parse a single entry line
-  defp parse_entry_line(%{content: content} = line_info, rest, base_indent, opts) do
+  defp parse_entry_line(%{content: content} = line_info, rest, base_indent, opts, metadata) do
+    # Track if key was quoted by checking if line starts with quote
+    was_quoted = key_was_quoted?(content)
+
     case Parser.parse_line(content) do
       {:ok, [result], "", _, _, _} ->
         case result do
           {key, value} when is_list(value) ->
+            updated_meta = add_key_to_metadata(key, was_quoted, metadata)
+
             # Check if this is an empty array with nested content (list or tabular format)
             # Pattern like items[3]: with indented lines following
             if value == [] and peek_next_indent(rest) > base_indent do
               # This is a list/tabular array header, not an inline array
               # Fall through to special line handling
-              case handle_special_line(line_info, rest, base_indent, opts) do
-                {:skip, _} ->
+              case handle_special_line(line_info, rest, base_indent, opts, updated_meta) do
+                {:skip, _, updated_meta2} ->
                   # If special line handling doesn't work, treat as empty array
-                  {:entry, key, [], rest}
+                  {:entry, key, [], rest, updated_meta2}
 
                 result ->
                   result
@@ -303,7 +345,7 @@ defmodule Toon.Decode.StructuralParser do
               # The Parser module may have already parsed numbers incorrectly
               # Extract array marker from content to get delimiter
               corrected_value =
-                case Regex.run(~r/^[\w"]+(\[#?(\d+)[^\]]*\]):/, content) do
+                case Regex.run(~r/^[\w"]+(\[(\d+)[^\]]*\]):/, content) do
                   [_, array_marker, length_str] ->
                     declared_length = String.to_integer(length_str)
                     delimiter = extract_delimiter(array_marker)
@@ -330,21 +372,26 @@ defmodule Toon.Decode.StructuralParser do
                     value
                 end
 
-              {:entry, key, corrected_value, rest}
+              {:entry, key, corrected_value, rest, updated_meta}
             end
 
           {key, value} when is_map(value) ->
+            updated_meta = add_key_to_metadata(key, was_quoted, metadata)
             # Simple value, not nested
-            {:entry, key, value, rest}
+            {:entry, key, value, rest, updated_meta}
 
           {key, value} ->
+            updated_meta = add_key_to_metadata(key, was_quoted, metadata)
+
             # Check if next lines are nested
             case peek_next_indent(rest) do
               indent when indent > base_indent ->
                 # Has nested content
-                nested_value = parse_nested_value(key, rest, base_indent, opts)
+                {nested_value, nested_meta} =
+                  parse_nested_value(key, rest, base_indent, opts, updated_meta)
+
                 {remaining_lines, _} = skip_nested_lines(rest, base_indent)
-                {:entry, key, nested_value, remaining_lines}
+                {:entry, key, nested_value, remaining_lines, nested_meta}
 
               _ ->
                 # Simple primitive value - re-parse the entire value to respect special cases
@@ -359,7 +406,7 @@ defmodule Toon.Decode.StructuralParser do
                       value
                   end
 
-                {:entry, key, corrected_value, rest}
+                {:entry, key, corrected_value, rest, updated_meta}
             end
         end
 
@@ -368,29 +415,31 @@ defmodule Toon.Decode.StructuralParser do
         # This handles cases like "note: a,b" where the parser stops at the comma
         case parsed_result do
           {key, _partial_value} ->
+            updated_meta = add_key_to_metadata(key, was_quoted, metadata)
+
             # Re-extract the full value from the original content
             case String.split(content, ": ", parts: 2) do
               [_, value_str] ->
                 full_value = parse_value(String.trim(value_str))
-                {:entry, key, full_value, rest}
+                {:entry, key, full_value, rest, updated_meta}
 
               _ ->
-                {:skip, rest}
+                {:skip, rest, metadata}
             end
 
           _ ->
-            {:skip, rest}
+            {:skip, rest, metadata}
         end
 
       {:ok, _, _, _, _, _} ->
         # Unexpected parse result
-        {:skip, rest}
+        {:skip, rest, metadata}
 
       {:error, reason, _, _, _, _} ->
         # Try to handle special cases like array headers
         # If it still fails, raise an error
-        case handle_special_line(line_info, rest, base_indent, opts) do
-          {:skip, _} ->
+        case handle_special_line(line_info, rest, base_indent, opts, metadata) do
+          {:skip, _, _meta} ->
             raise DecodeError,
               message: "Failed to parse line: #{reason}",
               input: content
@@ -401,66 +450,89 @@ defmodule Toon.Decode.StructuralParser do
     end
   end
 
+  # Pattern matching helpers for handle_special_line
+  defp tabular_array_header?(content), do: String.match?(content, @tabular_header_pattern)
+  defp list_array_header?(content), do: String.match?(content, @list_header_pattern)
+
+  defp nested_object_header?(content) do
+    String.ends_with?(content, ":") and not String.contains?(content, " ")
+  end
+
   # Handle special line formats (array headers, etc.)
-  defp handle_special_line(%{content: content} = line_info, rest, base_indent, opts) do
+  defp handle_special_line(%{content: content} = line_info, rest, base_indent, opts, metadata) do
     cond do
-      # Tabular array header: key[N]{fields}: or key[#N]{fields}: (with optional quoted key)
-      String.match?(content, ~r/^(?:"[^"]*"|\w+)\[#?\d+.*\]\{[^}]+\}:$/) ->
-        {key, array_value} = parse_tabular_array(line_info, rest, base_indent, opts)
-        {remaining, _} = skip_nested_lines(rest, base_indent)
-        {:entry, key, array_value, remaining}
+      tabular_array_header?(content) ->
+        parse_tabular_array_entry(line_info, rest, base_indent, opts, metadata)
 
-      # List array header: key[N]: or key[#N]: (with optional quoted key)
-      String.match?(content, ~r/^(?:"[^"]*"|\w+)\[#?\d+.*\]:$/) ->
-        {key, array_value} = parse_list_array(line_info, rest, base_indent, opts)
-        {remaining, _} = skip_nested_lines(rest, base_indent)
-        {:entry, key, array_value, remaining}
+      list_array_header?(content) ->
+        parse_list_array_entry(line_info, rest, base_indent, opts, metadata)
 
-      # Empty nested object: key:
-      String.ends_with?(content, ":") and not String.contains?(content, " ") ->
-        key = String.trim_trailing(content, ":")
-        key = unquote_key(key)
-
-        case peek_next_indent(rest) do
-          indent when indent > base_indent ->
-            # Has nested content
-            nested_value = parse_nested_object(rest, base_indent, opts)
-            {remaining, _} = skip_nested_lines(rest, base_indent)
-            {:entry, key, nested_value, remaining}
-
-          _ ->
-            # Empty object
-            {:entry, key, %{}, rest}
-        end
+      nested_object_header?(content) ->
+        parse_nested_object_entry(content, rest, base_indent, opts, metadata)
 
       true ->
-        {:skip, rest}
+        {:skip, rest, metadata}
+    end
+  end
+
+  defp parse_tabular_array_entry(line_info, rest, base_indent, opts, metadata) do
+    {{key, array_value}, updated_meta} =
+      parse_tabular_array(line_info, rest, base_indent, opts, metadata)
+
+    {remaining, _} = skip_nested_lines(rest, base_indent)
+    {:entry, key, array_value, remaining, updated_meta}
+  end
+
+  defp parse_list_array_entry(line_info, rest, base_indent, opts, metadata) do
+    {{key, array_value}, updated_meta} =
+      parse_list_array(line_info, rest, base_indent, opts, metadata)
+
+    {remaining, _} = skip_nested_lines(rest, base_indent)
+    {:entry, key, array_value, remaining, updated_meta}
+  end
+
+  defp parse_nested_object_entry(content, rest, base_indent, opts, metadata) do
+    key = content |> String.trim_trailing(":") |> unquote_key()
+    was_quoted = key_was_quoted?(content)
+    updated_meta = add_key_to_metadata(key, was_quoted, metadata)
+
+    case peek_next_indent(rest) do
+      indent when indent > base_indent ->
+        {nested_value, nested_meta} = parse_nested_object(rest, base_indent, opts, updated_meta)
+        {remaining, _} = skip_nested_lines(rest, base_indent)
+        {:entry, key, nested_value, remaining, nested_meta}
+
+      _ ->
+        {:entry, key, %{}, rest, updated_meta}
     end
   end
 
   # Parse nested value (object or array)
-  defp parse_nested_value(_key, lines, base_indent, opts) do
+  defp parse_nested_value(_key, lines, base_indent, opts, metadata) do
     nested_lines = take_nested_lines(lines, base_indent)
     # Use the actual indent of the first nested line, not base_indent + indent_size
     # This allows non-multiple indentation when strict=false
     actual_indent = get_first_content_indent(nested_lines)
-    parse_object_lines(nested_lines, actual_indent, opts)
+    parse_object_lines(nested_lines, actual_indent, opts, metadata)
   end
 
   # Parse nested object
-  defp parse_nested_object(lines, base_indent, opts) do
+  defp parse_nested_object(lines, base_indent, opts, metadata) do
     nested_lines = take_nested_lines(lines, base_indent)
     # Use the actual indent of the first nested line, not base_indent + indent_size
     actual_indent = get_first_content_indent(nested_lines)
-    parse_object_lines(nested_lines, actual_indent, opts)
+    parse_object_lines(nested_lines, actual_indent, opts, metadata)
   end
 
   # Parse tabular array
-  defp parse_tabular_array(%{content: header}, rest, base_indent, opts) do
+  defp parse_tabular_array(%{content: header}, rest, base_indent, opts, metadata) do
     # Extract key and fields from header (with optional # length marker and quoted key)
-    case Regex.run(~r/^((?:"[^"]*"|\w+))(\[#?\d+.*\])\{([^}]+)\}:$/, header) do
+    case Regex.run(~r/^((?:"[^"]*"|[\w.]+))(\[\d+.*\])\{([^}]+)\}:$/, header) do
       [_, raw_key, array_marker, fields_str] ->
         key = unquote_key(raw_key)
+        was_quoted = key_was_quoted?(header)
+        updated_meta = add_key_to_metadata(key, was_quoted, metadata)
+
         delimiter = extract_delimiter(array_marker)
         fields = parse_fields(fields_str, delimiter)
 
@@ -468,7 +540,7 @@ defmodule Toon.Decode.StructuralParser do
         data_rows = take_nested_lines(rest, base_indent)
         array_data = parse_tabular_data_rows(data_rows, fields, delimiter, opts)
 
-        {key, array_data}
+        {{key, array_data}, updated_meta}
 
       nil ->
         raise DecodeError, message: "Invalid tabular array header", input: header
@@ -502,20 +574,15 @@ defmodule Toon.Decode.StructuralParser do
           input: row_content
       end
 
-      # Build object from fields and values
+      # Build object from fields and values using helper
       entries = Enum.zip(fields, values)
-
-      case opts.keys do
-        :strings -> Map.new(entries)
-        :atoms -> Map.new(entries, fn {k, v} -> {String.to_atom(k), v} end)
-        :atoms! -> Map.new(entries, fn {k, v} -> {String.to_existing_atom(k), v} end)
-      end
+      build_map_with_keys(entries, opts)
     end)
   end
 
   # Parse tabular array data (for root arrays)
   defp parse_tabular_array_data(header, rest, base_indent, opts) do
-    case Regex.run(~r/^\[(#?(\d+))([^\]]*)\]\{([^}]+)\}:$/, header) do
+    case Regex.run(~r/^\[((\d+))([^\]]*)\]\{([^}]+)\}:$/, header) do
       [_, _full_length, length_str, delimiter_marker, fields_str] ->
         declared_length = String.to_integer(length_str)
         delimiter = extract_delimiter("[#{delimiter_marker}]")
@@ -538,12 +605,25 @@ defmodule Toon.Decode.StructuralParser do
   end
 
   # Parse list array
-  defp parse_list_array(%{content: header}, rest, base_indent, opts) do
-    case Regex.run(~r/^((?:"[^"]*"|\w+))\[#?(\d+).*\]:$/, header) do
-      [_, raw_key, length_str] ->
+  defp parse_list_array(%{content: header}, rest, base_indent, opts, metadata) do
+    case Regex.run(~r/^((?:"[^"]*"|[\w.]+))(\[\d+[^\]]*\]):$/, header) do
+      [_, raw_key, array_marker] ->
+        length_str =
+          case Regex.run(~r/\[(\d+)/, array_marker) do
+            [_, len] -> len
+            nil -> "0"
+          end
+
         declared_length = String.to_integer(length_str)
         key = unquote_key(raw_key)
-        items = parse_list_array_items(rest, base_indent, opts)
+        was_quoted = key_was_quoted?(header)
+        updated_meta = add_key_to_metadata(key, was_quoted, metadata)
+
+        # Extract delimiter from array marker and pass through opts
+        delimiter = extract_delimiter(array_marker)
+        opts_with_delimiter = Map.put(opts, :delimiter, delimiter)
+
+        items = parse_list_array_items(rest, base_indent, opts_with_delimiter)
 
         # Validate length
         if length(items) != declared_length do
@@ -552,7 +632,7 @@ defmodule Toon.Decode.StructuralParser do
             input: header
         end
 
-        {key, items}
+        {{key, items}, updated_meta}
 
       nil ->
         raise DecodeError, message: "Invalid list array header", input: header
@@ -598,242 +678,262 @@ defmodule Toon.Decode.StructuralParser do
     end
   end
 
+  # Pattern matching helpers for list item parsing
+  defp remove_list_marker(content) do
+    content
+    |> String.trim_leading()
+    |> String.replace_prefix("- ", "")
+    |> String.replace_prefix("-", "")
+  end
+
+  defp inline_array_with_values?(str), do: String.match?(str, @inline_array_pattern)
+  defp list_array_header_only?(str), do: String.match?(str, @list_array_header_pattern)
+
   # Parse a single list item
   defp parse_list_item(%{content: content} = line, rest, expected_indent, opts) do
-    # Remove list marker and parse
-    trimmed =
-      if String.starts_with?(String.trim_leading(content), "- ") do
-        String.trim_leading(content) |> String.replace_prefix("- ", "")
-      else
-        # Just "-" with no space after
-        String.trim_leading(content) |> String.replace_prefix("-", "")
-      end
+    trimmed = remove_list_marker(content)
+    route_list_item(trimmed, rest, line, expected_indent, opts)
+  end
 
-    # Check if this is an inline array: - [N]: val1,val2
+  defp route_list_item("", rest, _line, _expected_indent, _opts), do: {%{}, rest}
+
+  defp route_list_item(trimmed, rest, line, expected_indent, opts) do
+    trimmed_stripped = String.trim(trimmed)
+
     cond do
-      # Empty list item (just "-" or "- ")
-      trimmed == "" or String.trim(trimmed) == "" ->
+      trimmed_stripped == "" ->
         {%{}, rest}
 
-      # Inline array with values on same line: [N]: val1,val2 (has content after ": ")
-      String.match?(trimmed, ~r/^\[.*?\]: .+/) ->
+      inline_array_with_values?(trimmed) ->
         parse_inline_array_from_line(trimmed, rest)
 
-      # List-format array header only: [N]: (no content after colon, nested items below)
-      String.match?(trimmed, ~r/^\[#?\d+[^\]]*\]:$/) ->
+      list_array_header_only?(trimmed) ->
         parse_nested_list_array(trimmed, rest, line, expected_indent, opts)
 
-      # Tabular array as first field: key[N]{fields}: (with optional quoted key)
-      String.match?(trimmed, ~r/^(?:"[^"]*"|\w+)\[#?\d+.*\]\{[^}]+\}:$/) ->
+      tabular_array_header?(trimmed) ->
         parse_list_item_with_array(trimmed, rest, line, expected_indent, opts, :tabular)
 
-      # List array as first field: key[N]: (with optional quoted key)
-      String.match?(trimmed, ~r/^(?:"[^"]*"|\w+)\[#?\d+.*\]:$/) ->
+      list_array_header?(trimmed) ->
         parse_list_item_with_array(trimmed, rest, line, expected_indent, opts, :list)
 
       true ->
-        # Normal list item parsing (handles all cases including key: with nested content)
         parse_list_item_normal(trimmed, rest, line, expected_indent, opts)
     end
   end
 
   # Normal list item parsing (extracted to helper)
   defp parse_list_item_normal(trimmed, rest, line, expected_indent, opts) do
+    delimiter = Map.get(opts, :delimiter, ",")
+
     case Parser.parse_line(trimmed) do
       {:ok, [result], "", _, _, _} ->
-        case result do
-          {_key, _value} ->
-            # Object item - collect all fields including continuation lines
-            continuation_lines = take_item_lines(rest, expected_indent)
+        handle_complete_parse(result, trimmed, rest, line, expected_indent, opts)
 
-            # Determine the base indent for parsing the object
-            # If there are continuation lines, use the indent of the continuation lines
-            # Otherwise, use the current line's indent
-            item_indent =
-              if length(continuation_lines) > 0 do
-                # Find the minimum indent of continuation lines
-                continuation_lines
-                |> Enum.map(& &1.indent)
-                |> Enum.min()
-              else
-                # Single field object, use current line's pseudo-indent
-                line.indent
-              end
-
-            item_lines = [%{line | content: trimmed, indent: item_indent} | continuation_lines]
-            object = parse_object_lines(item_lines, item_indent, opts)
-
-            # Remaining is what's left after the continuation lines
-            remaining = Enum.drop(rest, length(continuation_lines))
-            {object, remaining}
-
-          value ->
-            # Primitive item
-            {value, rest}
-        end
+      {:ok, [{key, partial_value}], remaining_input, _, _, _}
+      when is_binary(remaining_input) and remaining_input != "" ->
+        handle_partial_parse(
+          key,
+          partial_value,
+          remaining_input,
+          delimiter,
+          rest,
+          line,
+          expected_indent,
+          opts
+        )
 
       {:error, _, _, _, _, _} ->
-        # Check if this is a key-only line (e.g., "data:") with nested content
-        if String.ends_with?(trimmed, ":") and not String.contains?(trimmed, " ") do
-          # Check if there are nested lines
-          next_indent = peek_next_indent(rest)
+        handle_parse_error(trimmed, rest, expected_indent, opts)
+    end
+  end
 
-          if next_indent > expected_indent do
-            # This is an object key with nested content
-            key = String.trim_trailing(trimmed, ":")
-            key = unquote_key(key)
+  # Handle case when parser fully consumed input
+  defp handle_complete_parse(result, trimmed, rest, line, expected_indent, opts) do
+    case result do
+      {_key, _value} ->
+        # Object item - collect all fields including continuation lines
+        continuation_lines = take_item_lines(rest, expected_indent)
 
-            # Take ONLY lines at the immediate next indent level (not shallower sibling fields)
-            # For "data:" at indent 2, with next line at indent 6:
-            # - Take lines at indent >= 6 (the nested content)
-            # - Stop at lines at indent 4 (sibling fields like "id: 2")
-            first_nested_indent = next_indent
-            nested_lines = take_lines_at_level(rest, first_nested_indent)
-
-            nested_value = parse_object_lines(nested_lines, first_nested_indent, opts)
-
-            # Skip only the lines we consumed (at the nested level)
-            remaining_after_nested =
-              Enum.drop_while(rest, fn line ->
-                !line.is_blank and line.indent >= first_nested_indent
-              end)
-
-            # Take remaining fields at the same level
-            more_fields = take_item_lines(remaining_after_nested, expected_indent)
-
-            if length(more_fields) > 0 do
-              # Parse remaining fields and merge
-              field_indent = more_fields |> Enum.map(& &1.indent) |> Enum.min()
-              remaining_object = parse_object_lines(more_fields, field_indent, opts)
-
-              object =
-                case opts.keys do
-                  :strings -> Map.put(remaining_object, key, nested_value)
-                  :atoms -> Map.put(remaining_object, String.to_atom(key), nested_value)
-                  :atoms! -> Map.put(remaining_object, String.to_existing_atom(key), nested_value)
-                end
-
-              final_remaining = Enum.drop(remaining_after_nested, length(more_fields))
-              {object, final_remaining}
-            else
-              # Just the single key
-              object =
-                case opts.keys do
-                  :strings -> %{key => nested_value}
-                  :atoms -> %{String.to_atom(key) => nested_value}
-                  :atoms! -> %{String.to_existing_atom(key) => nested_value}
-                end
-
-              {object, remaining_after_nested}
-            end
+        item_indent =
+          if length(continuation_lines) > 0 do
+            continuation_lines |> Enum.map(& &1.indent) |> Enum.min()
           else
-            # No nested content, treat as primitive value
-            value = parse_value(trimmed)
-            {value, rest}
+            line.indent
           end
+
+        item_lines = [%{line | content: trimmed, indent: item_indent} | continuation_lines]
+        # List items don't need metadata tracking (not top-level)
+        empty_metadata = %{quoted_keys: MapSet.new(), key_order: []}
+        {object, _} = parse_object_lines(item_lines, item_indent, opts, empty_metadata)
+        remaining = Enum.drop(rest, length(continuation_lines))
+        {object, remaining}
+
+      value ->
+        # Primitive item
+        {value, rest}
+    end
+  end
+
+  # Handle case when parser has remaining input
+  defp handle_partial_parse(
+         key,
+         partial_value,
+         remaining_input,
+         delimiter,
+         rest,
+         line,
+         expected_indent,
+         opts
+       ) do
+    # If delimiter is NOT comma but remaining starts with comma, the value has commas
+    if delimiter != "," and String.starts_with?(remaining_input, ",") do
+      # Re-parse: the full value is partial_value + remaining_input
+      full_value = parse_value(to_string(partial_value) <> remaining_input)
+
+      continuation_lines = take_item_lines(rest, expected_indent)
+
+      item_indent =
+        if length(continuation_lines) > 0 do
+          continuation_lines |> Enum.map(& &1.indent) |> Enum.min()
         else
-          # Primitive value without key - parse as standalone value
-          value = parse_value(trimmed)
-          {value, rest}
+          line.indent
         end
+
+      adjusted_content = "#{key}: #{full_value}"
+      item_lines = [%{line | content: adjusted_content, indent: item_indent} | continuation_lines]
+      # List items don't need metadata tracking (not top-level)
+      empty_metadata = %{quoted_keys: MapSet.new(), key_order: []}
+      {object, _} = parse_object_lines(item_lines, item_indent, opts, empty_metadata)
+      remaining = Enum.drop(rest, length(continuation_lines))
+      {object, remaining}
+    else
+      raise DecodeError,
+        message: "Parse failed: unexpected remaining input '#{remaining_input}'",
+        reason: :parse_error
+    end
+  end
+
+  # Handle case when parser failed
+  defp handle_parse_error(trimmed, rest, expected_indent, opts) do
+    # Check if this is a key-only line (e.g., "data:") with nested content
+    if String.ends_with?(trimmed, ":") and not String.contains?(trimmed, " ") do
+      next_indent = peek_next_indent(rest)
+
+      if next_indent > expected_indent do
+        parse_nested_key_with_content(trimmed, rest, next_indent, expected_indent, opts)
+      else
+        # No nested content, treat as primitive value
+        {parse_value(trimmed), rest}
+      end
+    else
+      # Primitive value without key - parse as standalone value
+      {parse_value(trimmed), rest}
+    end
+  end
+
+  # Helper to drop lines at a certain level
+  defp drop_lines_at_level(lines, min_indent) do
+    Enum.drop_while(lines, fn line -> !line.is_blank and line.indent >= min_indent end)
+  end
+
+  # Helper to build object with nested value
+  defp build_object_with_nested(key, nested_value, [], opts) do
+    put_key(empty_map(opts), key, nested_value, opts)
+  end
+
+  defp build_object_with_nested(key, nested_value, more_fields, opts) do
+    field_indent = more_fields |> Enum.map(& &1.indent) |> Enum.min()
+    empty_metadata = %{quoted_keys: MapSet.new(), key_order: []}
+    {remaining_object, _} = parse_object_lines(more_fields, field_indent, opts, empty_metadata)
+    put_key(remaining_object, key, nested_value, opts)
+  end
+
+  # Parse a key with nested content
+  defp parse_nested_key_with_content(trimmed, rest, next_indent, expected_indent, opts) do
+    key = trimmed |> String.trim_trailing(":") |> unquote_key()
+
+    # Take lines at the nested level
+    nested_lines = take_lines_at_level(rest, next_indent)
+    empty_metadata = %{quoted_keys: MapSet.new(), key_order: []}
+    {nested_value, _} = parse_object_lines(nested_lines, next_indent, opts, empty_metadata)
+
+    # Skip consumed nested lines
+    remaining_after_nested = drop_lines_at_level(rest, next_indent)
+
+    # Take remaining fields at the same level
+    more_fields = take_item_lines(remaining_after_nested, expected_indent)
+
+    object = build_object_with_nested(key, nested_value, more_fields, opts)
+
+    final_remaining =
+      if more_fields == [],
+        do: remaining_after_nested,
+        else: Enum.drop(remaining_after_nested, length(more_fields))
+
+    {object, final_remaining}
+  end
+
+  # Helper to get nested indent for list arrays
+  defp get_nested_indent([], expected_indent, opts),
+    do: expected_indent + Map.get(opts, :indent_size, 2)
+
+  defp get_nested_indent(lines, _expected_indent, _opts),
+    do: lines |> Enum.map(& &1.indent) |> Enum.min()
+
+  # Helper to parse remaining fields in list item
+  defp parse_remaining_fields([], _opts), do: empty_map(nil)
+
+  defp parse_remaining_fields(fields, opts) do
+    field_indent = fields |> Enum.map(& &1.indent) |> Enum.min()
+    empty_metadata = %{quoted_keys: MapSet.new(), key_order: []}
+    {result, _} = parse_object_lines(fields, field_indent, opts, empty_metadata)
+    result
+  end
+
+  # Parse array from tabular header
+  defp parse_array_from_header(trimmed, rest, expected_indent, opts, :tabular) do
+    case Regex.run(@tabular_header_regex, trimmed) do
+      [_, raw_key, array_marker, fields_str] ->
+        key = unquote_key(raw_key)
+        delimiter = extract_delimiter(array_marker)
+        fields = parse_fields(fields_str, delimiter)
+        array_lines = take_array_data_lines(rest, expected_indent, opts)
+        {key, parse_tabular_data_rows(array_lines, fields, delimiter, opts)}
+
+      nil ->
+        raise DecodeError, message: "Invalid tabular array in list item", input: trimmed
+    end
+  end
+
+  # Parse array from list header
+  defp parse_array_from_header(trimmed, rest, expected_indent, opts, :list) do
+    case Regex.run(@list_array_regex, trimmed) do
+      [_, raw_key, _length_str] ->
+        key = unquote_key(raw_key)
+        array_lines = take_array_data_lines(rest, expected_indent, opts)
+        nested_indent = get_nested_indent(array_lines, expected_indent, opts)
+        {key, parse_list_items(array_lines, nested_indent, opts, [])}
+
+      nil ->
+        raise DecodeError, message: "Invalid list array in list item", input: trimmed
     end
   end
 
   # Parse list item that starts with an array (tabular or list format)
   defp parse_list_item_with_array(trimmed, rest, _line, expected_indent, opts, array_type) do
-    # This handles cases like "- users[2]{id,name}:" or "- matrix[2]:"
-    # where the array is the first field in an object
-
-    # Extract the key and parse the array
-    {key, array_value} =
-      case array_type do
-        :tabular ->
-          # Extract key, fields from header (with optional quoted key)
-          case Regex.run(~r/^((?:"[^"]*"|\w+))(\[#?\d+.*\])\{([^}]+)\}:$/, trimmed) do
-            [_, raw_key, array_marker, fields_str] ->
-              key = unquote_key(raw_key)
-              delimiter = extract_delimiter(array_marker)
-              fields = parse_fields(fields_str, delimiter)
-
-              # Take the data rows for this array
-              array_lines = take_array_data_lines(rest, expected_indent)
-              array_data = parse_tabular_data_rows(array_lines, fields, delimiter, opts)
-
-              {key, array_data}
-
-            nil ->
-              raise DecodeError, message: "Invalid tabular array in list item", input: trimmed
-          end
-
-        :list ->
-          # Extract key from header (with optional quoted key)
-          case Regex.run(~r/^((?:"[^"]*"|\w+))\[#?(\d+).*\]:$/, trimmed) do
-            [_, raw_key, _length_str] ->
-              key = unquote_key(raw_key)
-
-              # Take the nested list items for this array
-              array_lines = take_array_data_lines(rest, expected_indent)
-
-              nested_indent =
-                if length(array_lines) > 0 do
-                  array_lines |> Enum.map(& &1.indent) |> Enum.min()
-                else
-                  expected_indent + 2
-                end
-
-              array_items = parse_list_items(array_lines, nested_indent, opts, [])
-
-              {key, array_items}
-
-            nil ->
-              raise DecodeError, message: "Invalid list array in list item", input: trimmed
-          end
-      end
-
-    # Now collect remaining fields for this object (e.g., "status: active")
-    # Skip the array data lines we already consumed
+    {key, array_value} = parse_array_from_header(trimmed, rest, expected_indent, opts, array_type)
     {rest_after_array, _} = skip_array_data_lines(rest, expected_indent)
-
-    # Take remaining fields at the same level as the list item
     remaining_fields = take_item_lines(rest_after_array, expected_indent)
 
-    # Parse remaining fields as an object
-    remaining_object =
-      if length(remaining_fields) > 0 do
-        field_indent =
-          remaining_fields
-          |> Enum.map(& &1.indent)
-          |> Enum.min()
+    remaining_object = parse_remaining_fields(remaining_fields, opts)
+    object = put_key(remaining_object, key, array_value, opts)
 
-        parse_object_lines(remaining_fields, field_indent, opts)
-      else
-        case opts.keys do
-          :strings -> %{}
-          :atoms -> %{}
-          :atoms! -> %{}
-        end
-      end
-
-    # Merge the array field with remaining fields
-    object =
-      case opts.keys do
-        :strings ->
-          Map.put(remaining_object, key, array_value)
-
-        :atoms ->
-          Map.put(remaining_object, String.to_atom(key), array_value)
-
-        :atoms! ->
-          Map.put(remaining_object, String.to_existing_atom(key), array_value)
-      end
-
-    # Skip all lines consumed
     {remaining, _} = skip_item_lines(rest, expected_indent)
     {object, remaining}
   end
 
   # Take lines for array data (until we hit a non-array line at same level or higher)
-  defp take_array_data_lines(lines, base_indent) do
+  defp take_array_data_lines(lines, base_indent, opts) do
     # For tabular arrays: take lines at depth > base_indent that DON'T look like fields
     # For list arrays: take all lines > base_indent (list items and their nested content)
 
@@ -848,11 +948,11 @@ defmodule Toon.Decode.StructuralParser do
 
     if is_list_array do
       # For list arrays, we need to carefully track list items and their content
-      # Find the expected indent of list items (should be base_indent + 2)
+      # Find the expected indent of list items (should be base_indent + indent_size)
       list_item_indent =
         case first_content do
           %{indent: indent} -> indent
-          nil -> base_indent + 2
+          nil -> base_indent + Map.get(opts, :indent_size, 2)
         end
 
       # Take all list items and their nested content
@@ -883,7 +983,7 @@ defmodule Toon.Decode.StructuralParser do
 
           line.indent > base_indent ->
             # Tabular array: take lines that don't look like "key: value"
-            not String.match?(line.content, ~r/^[\w"]+\s*:/)
+            not String.match?(line.content, @field_pattern)
 
           true ->
             false
@@ -934,7 +1034,7 @@ defmodule Toon.Decode.StructuralParser do
               true
 
             line.indent > base_indent ->
-              not String.match?(line.content, ~r/^[\w"]+\s*:/)
+              not String.match?(line.content, @field_pattern)
 
             true ->
               false
@@ -1022,97 +1122,138 @@ defmodule Toon.Decode.StructuralParser do
         delimiter
       end
 
-    # Split while respecting quoted strings
-    # Match either: "quoted string" or unquoted value (anything except delimiter)
-    delimiter_escaped = Regex.escape(actual_delimiter)
-    regex = ~r/("(?:[^"\\]|\\.)*"|[^#{delimiter_escaped}]+)/
-
-    Regex.scan(regex, row_str)
-    |> Enum.map(&hd/1)
+    # Split by delimiter, respecting quoted strings
+    # This handles spaces around delimiters and empty tokens
+    split_respecting_quotes(row_str, actual_delimiter)
     |> Enum.map(&String.trim/1)
     |> Enum.map(&parse_value/1)
   end
 
+  # Split a string by delimiter, but don't split inside quoted strings
+  defp split_respecting_quotes(str, delimiter) do
+    # Use a simple state machine approach with iolist building for O(n) performance
+    do_split_respecting_quotes(str, delimiter, [], false, [])
+  end
+
+  defp do_split_respecting_quotes("", _delimiter, current, _in_quote, acc) do
+    # Reverse current iolist and convert to string, then reverse acc
+    current_str = current |> Enum.reverse() |> IO.iodata_to_binary()
+    Enum.reverse([current_str | acc])
+  end
+
+  defp do_split_respecting_quotes(<<"\\", char, rest::binary>>, delimiter, current, in_quote, acc) do
+    # Escaped character - keep both backslash and char as iolist
+    do_split_respecting_quotes(rest, delimiter, [<<char>>, "\\" | current], in_quote, acc)
+  end
+
+  defp do_split_respecting_quotes(<<"\"", rest::binary>>, delimiter, current, in_quote, acc) do
+    # Toggle quote state
+    do_split_respecting_quotes(rest, delimiter, ["\"" | current], not in_quote, acc)
+  end
+
+  defp do_split_respecting_quotes(<<char, rest::binary>>, delimiter, current, false, acc)
+       when <<char>> == delimiter do
+    # Delimiter outside quotes - split here, convert current iolist to string
+    current_str = current |> Enum.reverse() |> IO.iodata_to_binary()
+    do_split_respecting_quotes(rest, delimiter, [], false, [current_str | acc])
+  end
+
+  defp do_split_respecting_quotes(<<char, rest::binary>>, delimiter, current, in_quote, acc) do
+    # Normal character - prepend to iolist
+    do_split_respecting_quotes(rest, delimiter, [<<char>> | current], in_quote, acc)
+  end
+
   # Parse a single value
   defp parse_value(str) do
-    trimmed = String.trim(str)
-
-    cond do
-      trimmed == "null" -> nil
-      trimmed == "true" -> true
-      trimmed == "false" -> false
-      String.starts_with?(trimmed, "\"") -> unquote_string(trimmed)
-      true -> parse_number_or_string(trimmed)
-    end
+    str |> String.trim() |> do_parse_value()
   end
+
+  defp do_parse_value("null"), do: nil
+  defp do_parse_value("true"), do: true
+  defp do_parse_value("false"), do: false
+  defp do_parse_value("\"" <> _ = str), do: unquote_string(str)
+  defp do_parse_value(str), do: parse_number_or_string(str)
 
   # Parse number or return as string
+  # Per TOON spec: numbers with leading zeros (except "0" itself) are treated as strings
+
+  # "0" and "-0" are valid numbers (both return 0)
+  defp parse_number_or_string("0"), do: 0
+  defp parse_number_or_string("-0"), do: 0
+
+  # Leading zeros make it a string (e.g., "05", "-007")
+  defp parse_number_or_string(<<"0", d, _rest::binary>> = str) when d in ?0..?9, do: str
+  defp parse_number_or_string(<<"-0", d, _rest::binary>> = str) when d in ?0..?9, do: str
+
+  # Try to parse as number, fall back to string
   defp parse_number_or_string(str) do
-    # Per TOON spec: numbers with leading zeros (except "0" itself) are treated as strings
-    cond do
-      # "0" by itself is a valid number
-      str == "0" ->
-        0
-
-      # "0" followed by digits is a string (leading zeros)
-      String.match?(str, ~r/^0\d/) ->
-        str
-
-      # Try to parse as number
-      true ->
-        case Float.parse(str) do
-          {num, ""} ->
-            if String.contains?(str, ".") do
-              num
-            else
-              String.to_integer(str)
-            end
-
-          _ ->
-            str
-        end
+    case Float.parse(str) do
+      {num, ""} -> normalize_parsed_number(num, str)
+      _ -> str
     end
   end
 
-  # Remove quotes from key
-  defp unquote_key(key) do
-    if String.starts_with?(key, "\"") and String.ends_with?(key, "\"") do
-      key
-      |> String.slice(1..-2//1)
-      |> unescape_string()
+  # Convert parsed float to appropriate type based on original string format
+  defp normalize_parsed_number(num, str) do
+    if has_decimal_or_exponent?(str) do
+      normalize_decimal_number(num)
     else
-      key
+      String.to_integer(str)
     end
+  end
+
+  defp has_decimal_or_exponent?(str) do
+    String.contains?(str, ".") or String.contains?(str, "e") or String.contains?(str, "E")
+  end
+
+  defp normalize_decimal_number(num) when num == trunc(num), do: trunc(num)
+  defp normalize_decimal_number(num), do: num
+
+  # Remove quotes from key
+  defp unquote_key("\"" <> _ = key) do
+    key |> String.slice(1..-2//1) |> unescape_string()
+  end
+
+  defp unquote_key(key), do: key
+
+  # Check if a key was originally quoted in the source line
+  defp key_was_quoted?(original_line) do
+    trimmed = String.trim_leading(original_line)
+    String.starts_with?(trimmed, "\"")
+  end
+
+  # Update metadata with a key, checking if it was quoted
+  defp add_key_to_metadata(key, was_quoted, metadata) do
+    updated_metadata =
+      if was_quoted do
+        %{metadata | quoted_keys: MapSet.put(metadata.quoted_keys, key)}
+      else
+        metadata
+      end
+
+    %{updated_metadata | key_order: updated_metadata.key_order ++ [key]}
   end
 
   # Remove quotes and unescape string
-  defp unquote_string(str) do
-    if String.starts_with?(str, "\"") do
-      # Check if string ends with an unescaped quote
-      # We need to check that the final " is not preceded by an odd number of backslashes
-      if properly_quoted?(str) do
-        str
-        |> String.slice(1..-2//1)
-        |> unescape_string()
-      else
-        raise DecodeError, message: "Unterminated string", input: str
-      end
+  defp unquote_string("\"" <> _ = str) do
+    if properly_quoted?(str) do
+      str |> String.slice(1..-2//1) |> unescape_string()
     else
-      str
+      raise DecodeError, message: "Unterminated string", input: str
     end
   end
 
+  defp unquote_string(str), do: str
+
   # Check if a quoted string is properly terminated
   # The string should start and end with " and the ending " should not be escaped
-  defp properly_quoted?(str) do
-    if String.length(str) < 2 do
-      false
-    else
-      String.starts_with?(str, "\"") and
-        String.ends_with?(str, "\"") and
-        not escaped_quote_at_end?(str)
-    end
+  defp properly_quoted?(str) when byte_size(str) < 2, do: false
+
+  defp properly_quoted?("\"" <> _ = str) do
+    String.ends_with?(str, "\"") and not escaped_quote_at_end?(str)
   end
+
+  defp properly_quoted?(_), do: false
 
   # Check if the closing quote is escaped
   defp escaped_quote_at_end?(str) do
@@ -1140,15 +1281,16 @@ defmodule Toon.Decode.StructuralParser do
     |> String.replace("\\n", "\n")
     |> String.replace("\\r", "\r")
     |> String.replace("\\t", "\t")
-    |> then(fn s ->
-      # Check for invalid escapes after handling valid ones
-      if String.match?(s, ~r/\\/) do
-        raise DecodeError, message: "Invalid escape sequence", input: str
-      else
-        s
-      end
-    end)
+    |> validate_no_invalid_escapes(str)
     |> String.replace(<<0>>, "\\")
+  end
+
+  defp validate_no_invalid_escapes(processed, original) do
+    if String.match?(processed, @invalid_escape_pattern) do
+      raise DecodeError, message: "Invalid escape sequence", input: original
+    else
+      processed
+    end
   end
 
   # Peek at next line's indent (skip blank lines)
